@@ -1,0 +1,226 @@
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: LambdaECSUpdateRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: LambdaECSUpdatePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:*
+                Resource: '*'
+
+  ECSUpdateLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: ECSUpdateLambda
+      Code:
+        ZipFile: |
+          import boto3, json
+
+          ecs = boto3.client('ecs')
+
+          def get_latest_task_definition_arn(family):
+              response = ecs.list_task_definitions(familyPrefix=family, sort='DESC')
+              if len(response['taskDefinitionArns']) == 0:
+                return None
+              latest_revision = response['taskDefinitionArns'][0]
+              
+              return latest_revision
+
+          def register_revision(latest_revision, image, tag):
+              task_definition = ecs.describe_task_definition(taskDefinition=latest_revision)
+              task_definition['taskDefinition']['containerDefinitions'][0]['image'] = f"{image}:{tag}"
+              ecs.register_task_definition(family=task_definition['taskDefinition']['family'],containerDefinitions=task_definition['taskDefinition']['containerDefinitions'])
+              return True
+
+          def update_ecs_service(cluster, service, image, tag):
+              family = get_task_families(cluster=cluster, service=service)
+              latest_revision = get_latest_task_definition_arn(family=family)
+              if latest_revision is None: return None
+
+              register_revision(latest_revision, image, tag)
+
+              new_revision = get_latest_task_definition_arn(family=family)
+
+              response = ecs.update_service(
+                  cluster=cluster,
+                  service=service,
+                  taskDefinition=new_revision,
+              )
+
+              return response
+
+          def get_task_families(cluster, service):
+              response = ecs.describe_services(
+                  cluster=cluster,
+                  services=[service]
+              )
+
+              if 'services' in response and len(response['services']) > 0:
+                  service = response['services'][0]
+                  task_definition_arns = service.get('deployments', [])[0].get('taskDefinition')
+                  if isinstance(task_definition_arns, str):
+                      return task_definition_arns.split('/')[1].split(':')[0]
+                  elif isinstance(task_definition_arns, list):
+                      family_list = []
+                      for arn in task_definition_arns:
+                          family = arn.split('/')[1].split(':')[0]
+                          family_list.append(family)
+                      return family_list
+                  else:
+                      return []
+              else:
+                  return []
+
+          def lambda_handler(event, context):
+              body = json.loads(event['body'])
+              try:
+                  cluster = body['cluster']
+                  service = body['service']
+                  image = body['image']
+                  tag = body['tag']
+              except Exception as e:
+                  return {
+                    'body':f"parsing::{body}::{body['cluster']}"
+                  }
+              try:
+                  response = update_ecs_service(cluster, service, image, tag)
+                  return {
+                      'statusCode': 204,
+                      'body': "No active task definition"
+                  } if response is None else {
+                      'statusCode': 200,
+                      'body': f"New task definition created: {response}"
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f"{str(e)}::{event['body'][0]}"
+                  }
+
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.8
+
+  ECSUpdatePermissions:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ECSUpdateLambda.Arn
+      Principal: apigateway.amazonaws.com
+
+  ECSUpdateAPI:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: ECSUpdateAPI
+
+  ECSUpdateResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt ECSUpdateAPI.RootResourceId
+      RestApiId: !Ref ECSUpdateAPI
+      PathPart: 'update'
+
+  ECSUpdateMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref ECSUpdateResource
+      RestApiId: !Ref ECSUpdateAPI
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ECSUpdateLambda.Arn}/invocations
+        RequestTemplates:
+          application/json: |
+            { "body" : $input.json('$') }
+      RequestModels:
+        'application/json': !Ref ECSUpdateApiModel
+
+  ECSUpdateApiModel:
+    Type: 'AWS::ApiGateway::Model'
+    Properties:
+      RestApiId: !Ref ECSUpdateAPI
+      Name: ECSUpdateApiModel
+      ContentType: 'application/json'
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        type: object
+        properties:
+          cluster:
+            type: string
+          service:
+            type: string
+          image:
+            type: string
+          tag:
+            type: string
+
+  ECSUpdateApiKey:
+    Type: 'AWS::ApiGateway::ApiKey'
+    Properties:
+      Name: ECSUpdateApiKey
+      Enabled: true
+
+  ECSUpdateUsagePlan:
+    Type: 'AWS::ApiGateway::UsagePlan'
+    Properties:
+      ApiStages:
+        - ApiId: !Ref ECSUpdateAPI
+          Stage: !Ref ECSUpdateStage
+      Quota:
+        Limit: 100
+        Period: MONTH
+      Throttle:
+        BurstLimit: 20
+        RateLimit: 10
+
+  ECSUpdateUsagePlanKey:
+    Type: 'AWS::ApiGateway::UsagePlanKey'
+    Properties:
+      KeyId: !Ref ECSUpdateApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ECSUpdateUsagePlan
+
+  ECSUpdateStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      RestApiId: !Ref ECSUpdateAPI
+      StageName: prod
+      DeploymentId: !Ref ECSUpdateDeployment
+
+  ECSUpdateDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn: ECSUpdateMethod
+    Properties:
+      RestApiId: !Ref ECSUpdateAPI
+
+  LambdaPermissionForAPI:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ECSUpdateLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ECSUpdateAPI}/*/*/update
+
+Outputs:
+  ApiInvokeUrl:
+    Value: !Sub https://${ECSUpdateAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/update
+  ECSUpdateApiKey:
+    Value:
+      Fn::Sub:
+        - 'https://${AWS::Region}.console.aws.amazon.com/apigateway/home?region=${AWS::Region}#/api-keys/${ApiKey}'
+        - ApiKey: !Ref ECSUpdateApiKey
