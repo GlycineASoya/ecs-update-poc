@@ -1,0 +1,27 @@
+Resources:
+  MyTaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      Family: family
+      ContainerDefinitions:
+        - Name: container
+          Image: nginx:latest
+          Memory: 16
+          Cpu: 150
+  
+  MyService:
+    Type: 'AWS::ECS::Service'
+    Properties:
+      ServiceName: service
+      Cluster: !ImportValue ecs-cluster-name
+      TaskDefinition: !Ref MyTaskDefinition
+      DesiredCount: 1
+
+Outputs:
+  ECSClusterName:
+    Value: !ImportValue ecs-cluster-name
+    Description: ECS Cluster Name
+
+  ECSServiceName:
+    Value: !GetAtt MyService.Name
+    Description: ECS Service Name
